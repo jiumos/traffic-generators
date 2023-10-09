@@ -9,14 +9,15 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"sync/atomic"
 )
 
 const (
-	MIN_SERVER_PORT  = 10000
-	MAX_SERVER_PORT  = 14999
+	MIN_SERVER_PORT  = 20000
+	MAX_SERVER_PORT  = 24999
 	NEW_FLOW_PER_SEC = 800
 
-	REQUEST_PER_FLOW = 18
+	REQUEST_PER_FLOW = 60
 	REQUEST_INTERVAL = 5 * time.Second
 
 	L7_PROTOCOL_UNKNOWN = 1
@@ -24,6 +25,8 @@ const (
 )
 
 var (
+	liveConnection     = int64(0)
+	maxConcurrent      = 100000
 	l7Protocol         = L7_PROTOCOL_UNKNOWN
 	httpRequestPayload = `GET /index.html HTTP/1.1
 Host: high-connection-load-generator
@@ -50,6 +53,7 @@ func setLimit() {
 }
 
 func newConnection(dialer *net.Dialer, serverIp string, serverPort int) {
+	atomic.AddInt64(&liveConnection, 1)
 	startTime := time.Now()
 
 	conn, err := dialer.Dial("tcp", serverIp+":"+strconv.Itoa(serverPort))
@@ -57,7 +61,7 @@ func newConnection(dialer *net.Dialer, serverIp string, serverPort int) {
 		fmt.Printf("Dial server #%d from %s failed ...: %s\n", serverPort, dialer.LocalAddr, err.Error())
 		return
 	}
-
+	defer conn.Close()
 	// fmt.Printf("Request %d: local %s, remote %s\n", serverPort, conn.LocalAddr(), conn.RemoteAddr())
 	reader := bufio.NewReader(conn)
 	for i := 0; i < REQUEST_PER_FLOW; i++ {
@@ -102,23 +106,23 @@ func newConnection(dialer *net.Dialer, serverIp string, serverPort int) {
 
 		time.Sleep(REQUEST_INTERVAL)
 	}
-
+	atomic.AddInt64(&liveConnection, -1)
 	// fmt.Printf("Finished %d: local %s, remote %s\n", serverPort, conn.LocalAddr(), conn.RemoteAddr())
 }
 
 func main() {
-	if len(os.Args) != 2 && len(os.Args) != 3 {
-		fmt.Printf("./tcpclient remote_addr_1,remote_addr_2,... [local_addr_1,local_addr_2...]")
+	if len(os.Args) != 3 && len(os.Args) != 4 {
+		fmt.Printf("./tcpclient concurrent remote_addr_1,remote_addr_2,... [local_addr_1,local_addr_2...]")
 		return
 	}
 	setLimit()
-
-	serverIps := strings.Split(os.Args[1], ",")
+	maxConcurrent, _ = strconv.Atoi(os.Args[1])
+	serverIps := strings.Split(os.Args[2], ",")
 	clientIps := []string{}
-	if len(os.Args) == 2 {
+	if len(os.Args) == 3 {
 		fmt.Printf("Dail %s\n", serverIps)
 	} else {
-		clientIps = strings.Split(os.Args[2], ",")
+		clientIps = strings.Split(os.Args[3], ",")
 		fmt.Printf("Dail %s from %s\n", serverIps, clientIps)
 	}
 
@@ -135,6 +139,12 @@ func main() {
 	}
 
 	for serverPort := MIN_SERVER_PORT; ; serverPort++ {
+		if  atomic.LoadInt64(&liveConnection) + 1 > int64(maxConcurrent){
+			time.Sleep(time.Second)
+			timeStart = time.Now()
+			sleepCounter = 0
+			continue
+		}
 		if serverPort > MAX_SERVER_PORT {
 			serverPort = MIN_SERVER_PORT
 			if len(clientIps) > 0 {
@@ -153,9 +163,9 @@ func main() {
 		sleepCounter += 1
 		if sleepCounter >= NEW_FLOW_PER_SEC {
 			timeElapsed := time.Since(timeStart)
-			fmt.Printf("Create %d connections, clientIp %s, serverIp %s, serverport %d-%d ~ %d, cost %v\n",
+			fmt.Printf("Create %d connections, clientIp %s, serverIp %s, serverport %d-%d ~ %d, cost %v, curConnections:%d\n",
 				sleepCounter, clientIps[clientIpIndex], serverIps[serverIpIndex],
-				serverPort, sleepCounter, serverPort, timeElapsed)
+				serverPort, sleepCounter, serverPort, timeElapsed, atomic.LoadInt64(&liveConnection))
 			if timeElapsed < time.Second {
 				time.Sleep(time.Second - timeElapsed)
 			}
